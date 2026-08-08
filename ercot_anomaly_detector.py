@@ -179,8 +179,14 @@ def _get_api_key() -> str:
     return api_key
 
 
-def _fetch_rows(api_key: str, start: str, end: str) -> list[dict]:
-    """Page through one date range and return the raw rows."""
+def _fetch_rows(api_key: str, start: str, end: str, respondent: str | None = None) -> list[dict]:
+    """
+    Page through one date range and return the raw rows.
+
+    respondent defaults to RESPONDENT (ERCO) for the CLI's fixed-grid modes.
+    The dashboard passes an explicit code so it can pull any EIA respondent,
+    not just ERCOT.
+    """
     import requests
 
     rows: list[dict] = []
@@ -190,7 +196,7 @@ def _fetch_rows(api_key: str, start: str, end: str) -> list[dict]:
             "api_key": api_key,
             "frequency": "hourly",
             "data[0]": "value",
-            "facets[respondent][]": RESPONDENT,
+            "facets[respondent][]": respondent or RESPONDENT,
             "facets[type][]": DATA_TYPE,
             "start": start,
             "end": end,
@@ -905,6 +911,31 @@ def main(argv: list[str]) -> int:
 
 SAMPLE_PATH = Path("sample_data/ercot_demand_sample.csv")
 
+# EIA respondent codes for electricity/rto/region-data, with a friendly label
+# and the IANA timezone each grid operates on (needed so "local time" grouping
+# and the day/night sanity check mean something - converting California data
+# to Central time would silently misdate every hour). Not exhaustive; "Other"
+# lets you type any EIA respondent code, verified against
+# https://www.eia.gov/opendata/browser/electricity/rto/region-data
+RESPONDENTS = {
+    "ERCO": ("ERCOT (Texas)", "America/Chicago"),
+    "CISO": ("California ISO", "America/Los_Angeles"),
+    "PJM":  ("PJM Interconnection (Mid-Atlantic/Midwest)", "America/New_York"),
+    "MISO": ("Midcontinent ISO", "America/Chicago"),
+    "SWPP": ("Southwest Power Pool", "America/Chicago"),
+    "NYIS": ("New York ISO", "America/New_York"),
+    "ISNE": ("ISO New England", "America/New_York"),
+    "SOCO": ("Southern Company", "America/New_York"),
+    "FPL":  ("Florida Power & Light", "America/New_York"),
+}
+
+
+def _archive_path_for(respondent: str) -> Path:
+    """ERCO keeps the original data/ercot_demand.csv for backward compatibility;
+    every other respondent gets its own file so grids never mix in one archive."""
+    respondent = respondent.strip().upper()
+    return DATA_PATH if respondent == RESPONDENT else DATA_PATH.parent / f"{respondent.lower()}_demand.csv"
+
 
 def _normalize_uploaded(raw: pd.DataFrame) -> pd.DataFrame:
     """Accept either raw EIA export columns (period, value) or the loaded
@@ -927,9 +958,10 @@ def _normalize_uploaded(raw: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _dashboard_merge_archive(new_rows: pd.DataFrame) -> dict:
+def _dashboard_merge_archive(new_rows: pd.DataFrame, path: Path) -> dict:
     """
-    Merge new_rows into the on-disk archive, dedupe by hour, write atomically.
+    Merge new_rows into the on-disk archive at `path`, dedupe by hour, write
+    atomically.
 
     Deliberately uncapped, unlike the ARCHIVE_DAYS rolling window used by
     update_archive() for --live/--watch. The dashboard's whole point is
@@ -938,8 +970,8 @@ def _dashboard_merge_archive(new_rows: pd.DataFrame) -> dict:
     discarded for being outside a trailing window.
     """
     parts = [new_rows[["period", "value"]]]
-    if DATA_PATH.exists():
-        prior = pd.read_csv(DATA_PATH)
+    if path.exists():
+        prior = pd.read_csv(path)
         prior["period"] = pd.to_datetime(prior["period"], utc=True)
         prior["value"] = pd.to_numeric(prior["value"], errors="coerce")
         parts.insert(0, prior[["period", "value"]])
@@ -947,38 +979,54 @@ def _dashboard_merge_archive(new_rows: pd.DataFrame) -> dict:
     merged = pd.concat(parts, ignore_index=True)
     merged = merged.drop_duplicates(subset="period", keep="last").sort_values("period")
 
-    DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = DATA_PATH.with_suffix(".tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
     merged.to_csv(tmp, index=False)
-    tmp.replace(DATA_PATH)  # atomic on POSIX and Windows
+    tmp.replace(path)  # atomic on POSIX and Windows
 
     return {"imported": len(new_rows), "total": len(merged),
             "start": merged["period"].min(), "end": merged["period"].max()}
 
 
 @st.cache_data(show_spinner="Scoring the archive...")
-def _score_archive_cached(path_str: str, mtime: float) -> pd.DataFrame:
-    return detect_anomalies(load_demand(Path(path_str)))
+def _score_archive_cached(path_str: str, mtime: float, local_tz: str | None) -> pd.DataFrame:
+    return detect_anomalies(load_demand(Path(path_str), local_tz=local_tz))
 
 
 def run_dashboard() -> None:
-    st.set_page_config(page_title="ERCOT Anomaly Detector", layout="wide", page_icon="⚡")
+    st.set_page_config(page_title="Electricity Demand Anomaly Detector", layout="wide", page_icon="⚡")
+
+    # ---------------------------------------------------------------- grid --
+    st.sidebar.header("Grid")
+    labels = {f"{code} — {name}": code for code, (name, _tz) in RESPONDENTS.items()}
+    labels["Other (enter EIA respondent code)"] = None
+    choice = st.sidebar.selectbox("EIA respondent", list(labels))
+    respondent = labels[choice] or st.sidebar.text_input(
+        "Respondent code", value=RESPONDENT,
+        help="Any code from EIA's electricity/rto/region-data respondents.",
+    ).strip().upper()
+    grid_name, local_tz = RESPONDENTS.get(respondent, (respondent, None))
+    if local_tz is None:
+        st.sidebar.caption(f"Unknown timezone for {respondent} - showing raw UTC timestamps.")
+    st.sidebar.caption("Full list: eia.gov/opendata/browser/electricity/rto/region-data")
+
+    data_path = _archive_path_for(respondent)
 
     # ---------------------------------------------------------- sidebar --
     st.sidebar.header("Import data")
 
-    with st.sidebar.expander("Upload a CSV", expanded=not DATA_PATH.exists()):
+    with st.sidebar.expander("Upload a CSV", expanded=not data_path.exists()):
         st.caption("Columns: 'period' + 'value' (EIA raw export) or 'timestamp' + 'demand'. Any date range.")
-        uploaded = st.file_uploader("CSV file", type="csv", label_visibility="collapsed")
+        uploaded = st.file_uploader("CSV file", type="csv", label_visibility="collapsed", key=f"upload_{respondent}")
         if uploaded is not None:
-            sig = (uploaded.name, uploaded.size)
+            sig = (respondent, uploaded.name, uploaded.size)
             if st.session_state.get("_last_upload_sig") != sig:
                 try:
                     norm = _normalize_uploaded(pd.read_csv(uploaded))
-                    stats = _dashboard_merge_archive(norm)
+                    stats = _dashboard_merge_archive(norm, data_path)
                     st.session_state["_last_upload_sig"] = sig
                     st.success(
-                        f"Imported {stats['imported']:,} rows. Archive: {stats['total']:,} rows "
+                        f"Imported {stats['imported']:,} rows. {respondent} archive: {stats['total']:,} rows "
                         f"({stats['start']:%Y-%m-%d} to {stats['end']:%Y-%m-%d})."
                     )
                     st.cache_data.clear()
@@ -986,7 +1034,7 @@ def run_dashboard() -> None:
                     st.error(f"Import failed: {e}")
 
     with st.sidebar.expander("Fetch from EIA API"):
-        st.caption("Any date range, anywhere in EIA's history for this respondent - not limited to recent days.")
+        st.caption(f"Any date range, anywhere in EIA's history for {respondent} - not limited to recent days.")
         try:
             default_key = st.secrets.get("EIA_API_KEY", "")
         except Exception:
@@ -1006,18 +1054,19 @@ def run_dashboard() -> None:
                 st.error("Start date is after end date.")
             else:
                 try:
-                    with st.spinner("Fetching from EIA..."):
+                    with st.spinner(f"Fetching {respondent} from EIA..."):
                         rows = _fetch_rows(
                             api_key,
                             pd.Timestamp(fetch_start).strftime("%Y-%m-%dT%H"),
                             pd.Timestamp(fetch_end).strftime("%Y-%m-%dT%H"),
+                            respondent=respondent,
                         )
                     if not rows:
-                        st.warning("EIA returned no rows for that range.")
+                        st.warning("EIA returned no rows for that range. Double-check the respondent code.")
                     else:
-                        stats = _dashboard_merge_archive(_normalise(rows))
+                        stats = _dashboard_merge_archive(_normalise(rows), data_path)
                         st.success(
-                            f"Fetched {stats['imported']:,} rows. Archive: {stats['total']:,} rows "
+                            f"Fetched {stats['imported']:,} rows. {respondent} archive: {stats['total']:,} rows "
                             f"({stats['start']:%Y-%m-%d} to {stats['end']:%Y-%m-%d})."
                         )
                         st.cache_data.clear()
@@ -1028,26 +1077,27 @@ def run_dashboard() -> None:
                     st.error(f"Fetch failed: {e}")
 
     col1, col2 = st.sidebar.columns(2)
-    if col1.button("Load sample", help="Seed the archive with bundled ERCOT demo data (summer 2023)."):
+    if col1.button("Load sample", help="Seed the archive with bundled ERCOT demo data (summer 2023).",
+                   disabled=respondent != RESPONDENT):
         if SAMPLE_PATH.exists():
-            DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy(SAMPLE_PATH, DATA_PATH)
+            data_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(SAMPLE_PATH, data_path)
             st.cache_data.clear()
             st.rerun()
         else:
             st.sidebar.error("No bundled sample data in this deployment.")
     if col2.button("Clear archive"):
-        DATA_PATH.unlink(missing_ok=True)
+        data_path.unlink(missing_ok=True)
         st.cache_data.clear()
         st.rerun()
 
-    if DATA_PATH.exists():
-        n_rows = sum(1 for _ in open(DATA_PATH)) - 1
-        st.sidebar.caption(f"Archive on disk: {n_rows:,} rows")
+    if data_path.exists():
+        n_rows = sum(1 for _ in open(data_path)) - 1
+        st.sidebar.caption(f"{respondent} archive on disk: {n_rows:,} rows")
 
     # ------------------------------------------------------------ guard --
-    if not DATA_PATH.exists():
-        st.title("ERCOT Demand Anomaly Detector")
+    if not data_path.exists():
+        st.title(f"{grid_name} Demand Anomaly Detector")
         st.info(
             "No data loaded yet. Use the sidebar to upload a CSV, fetch from the EIA API "
             "(any date range), or load the bundled sample data to explore the dashboard."
@@ -1055,14 +1105,15 @@ def run_dashboard() -> None:
         st.stop()
 
     try:
-        df = _score_archive_cached(str(DATA_PATH), DATA_PATH.stat().st_mtime)
+        df = _score_archive_cached(str(data_path), data_path.stat().st_mtime, local_tz)
     except Exception as e:
         st.error(f"Couldn't score the current archive: {e}")
         st.stop()
 
     # ----------------------------------------------------------- filters --
-    st.title("ERCOT Demand Anomaly Detector")
-    st.caption(f"{df.index.min():%Y-%m-%d} to {df.index.max():%Y-%m-%d} · ERCOT hourly demand, Central time")
+    st.title(f"{grid_name} Demand Anomaly Detector")
+    tz_label = f"{local_tz} time" if local_tz else "UTC (unrecognized grid timezone)"
+    st.caption(f"{df.index.min():%Y-%m-%d} to {df.index.max():%Y-%m-%d} · {respondent} hourly demand, {tz_label}")
 
     st.sidebar.header("Filters")
     min_d, max_d = df.index.min().date(), df.index.max().date()
