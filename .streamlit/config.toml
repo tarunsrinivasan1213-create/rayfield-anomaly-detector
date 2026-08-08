@@ -1,0 +1,8 @@
+[theme]
+base = "light"
+primaryColor = "#4C78A8"
+
+[server]
+headless = true
+enableXsrfProtection = true
+maxUploadSize = 25

@@ -1,0 +1,9 @@
+.env
+.streamlit/secrets.toml
+data/
+outputs/
+__pycache__/
+*.pyc
+selftest_data.csv
+dst_tmp.csv
+.DS_Store
