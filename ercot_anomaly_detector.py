@@ -1,73 +1,3 @@
-"""
-====================================================================
- OPERATIONS ANOMALY DETECTOR - ERCOT Hourly Electricity Demand
- Rayfield Systems Technical Project | Option A
-====================================================================
-
-Finds unusual hours in ERCOT (Texas) electricity demand, scores how unusual each
-one is, and explains why in plain language.
-
-  Input : hourly demand readings, U.S. EIA Open Data API v2 (respondent ERCO, type D)
-  Output: one row per hour with a severity score, an anomaly type, and a written reason
-
---------------------------------------------------------------------
- QUICK START
---------------------------------------------------------------------
-    pip install -r requirements.txt
-
-    echo "EIA_API_KEY=your_key_here" > .env
-    echo ".env" >> .gitignore
-
-  Dashboard (import data from any time range, any time, and explore it):
-    streamlit run ercot_anomaly_detector.py
-
-  Historical mode (the Demo Day run, fixed June-August 2023 window):
-    python ercot_anomaly_detector.py              # fetch (cached) + score + report
-    python ercot_anomaly_detector.py --refresh    # force a fresh API pull
-
-  Live mode (continuous operation on new data as EIA publishes it):
-    python ercot_anomaly_detector.py --live       # one update-and-alert cycle
-    python ercot_anomaly_detector.py --watch 60   # a cycle every 60 minutes
-
-  Always available:
-    python ercot_anomaly_detector.py --selftest   # prove it works, no API needed
-    python ercot_anomaly_detector.py --diagnose   # check the timezone assumption
-
-The dashboard and the CLI are the same file. Running it with `streamlit run`
-launches the interactive UI; running it with plain `python` uses argv to pick
-one of the CLI modes above. Both share every fetch/load/score function below,
-so there is exactly one detection implementation regardless of how you use it.
-
---------------------------------------------------------------------
- HOW LIVE MODE WORKS
---------------------------------------------------------------------
-Each cycle re-pulls the last 7 days (EIA revises recently published hours during
-settlement), merges them over the stored values, prunes the archive to 120 days,
-re-scores the WHOLE archive so the baselines stay warm, then reports only hours
-that were not flagged on a previous run. Already-reported hours are tracked in
-data/state.json.
-
-Nothing about the detection logic changes between the two modes. Every baseline
-is trailing-only - it never uses the current reading or anything after it - so
-the tool produces identical output on historical data and on a live feed. There
-is no retraining step.
-
-Cron is a better scheduler than --watch for anything real:
-    0 * * * * cd /path/to/repo && python ercot_anomaly_detector.py --live
-
---------------------------------------------------------------------
- GROUND TRUTH IN THIS WINDOW
---------------------------------------------------------------------
-Summer 2023 was ERCOT's record-breaking summer: 10 new all-time peak demand
-records, ending with 85,464 MW on August 10, 2023. Those dates are listed in
-KNOWN_EVENTS below and the script reports, unprompted, whether the detector
-caught each one. That is the honest evaluation, not a claim of success.
-
-Reported peak values differ slightly between sources (85,435 unofficial ->
-85,464 -> 85,508 after settlement), so treat them as approximate. The detector
-never uses these numbers; they are for validation only.
-"""
-
 from __future__ import annotations
 
 import json
@@ -82,32 +12,23 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-# ====================================================================
-# CONFIG - everything tunable lives here
-# ====================================================================
 
 # --- data source ----------------------------------------------------
 EIA_URL = "https://api.eia.gov/v2/electricity/rto/region-data/data/"
 RESPONDENT = "ERCO"          # ERCOT (Texas)
 DATA_TYPE = "D"              # D = demand
 
-# The analysis window is June-August 2023. The pull starts a month EARLIER on
-# purpose: the level baseline needs 3 prior same-weekday-same-hour readings plus
-# 72 hours of residuals before it can score anything. Starting the pull on June 1
-# leaves June 1-24 unscoreable, which is 26% of the target window.
-FETCH_START = "2025-12-01T00"     # a month early, for warm-up
+
+FETCH_START = "2025-12-01T00"     
 FETCH_END = "2026-08-03T23"
 ANALYSIS_START = "2026-01-01"
 ANALYSIS_END = "2026-06-30"
 
-PAGE_SIZE = 5000             # EIA's per-request maximum
+PAGE_SIZE = 5000             
 DATA_PATH = Path("data/ercot_demand.csv")
 OUT_PATH = Path("outputs/scored_hours.csv")
 
 # --- live mode ------------------------------------------------------
-# The archive must always hold enough trailing history to warm the baselines up:
-# 4 weeks for the level slots plus 14 days of residuals for the spread. 120 days
-# is comfortably past that and keeps the file small.
 ARCHIVE_DAYS = 120
 BACKFILL_DAYS = 120          # how far back to reach on a cold start
 REVISION_DAYS = 7            # re-pull this much trailing data every run
@@ -129,11 +50,6 @@ CHANGE_MIN_HISTORY = 7
 SCALE_WINDOW = 336       # hours of residual history used for the spread (14 days)
 SCALE_MIN_HISTORY = 72
 
-# MEDIAN, not mean. Summer 2023 set ten records, so a previous record day often
-# sits inside the baseline window and a mean baseline inflates the expectation,
-# hiding the next record. Measured on synthetic data with all ten records
-# injected: median lifts the Aug 10 level score from z=4.5 to z=5.2 at an
-# identical 2.3% flag rate. Strictly better, so median it is.
 CENTER = "median"
 
 FLAG_THRESHOLD = 3.0     # |z| at or above this is flagged
@@ -144,8 +60,7 @@ MAD_TO_SIGMA = 1.4826    # scales a median-absolute-deviation to a normal sigma
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 # --- validation -----------------------------------------------------
-# ERCOT all-time peak demand records set inside the analysis window.
-# (date, approximate reported peak MW, note)
+
 KNOWN_EVENTS = [
     ("2023-06-26", None,  "record broken daily Jun 26-29, each above 80,000 MW"),
     ("2023-06-27", 80787, "all-time record"),
@@ -161,9 +76,7 @@ KNOWN_EVENTS = [
 ]
 
 
-# ====================================================================
 # 1. FETCH
-# ====================================================================
 
 def _get_api_key() -> str:
     from dotenv import load_dotenv
@@ -257,9 +170,7 @@ def fetch_ercot_demand(path: Path | None = None, refresh: bool = False) -> Path:
     return path
 
 
-# ====================================================================
 # 1b. LIVE MODE - incremental archive
-# ====================================================================
 
 def update_archive(path: Path | None = None, now: pd.Timestamp | None = None) -> tuple[pd.DataFrame, dict]:
     """
@@ -335,9 +246,7 @@ def _state_save(state: dict, path: Path | None = None) -> None:
     path.write_text(json.dumps(state, indent=2))
 
 
-# ====================================================================
 # 2. LOAD & CLEAN
-# ====================================================================
 
 def load_demand(path, period_col: str = "period", value_col: str = "value",
                 source_tz: str | None = SOURCE_TZ,
@@ -375,12 +284,7 @@ def load_demand(path, period_col: str = "period", value_col: str = "value",
     df = df.drop_duplicates(subset="timestamp", keep="last")
     df = df.sort_values("timestamp").set_index("timestamp")
 
-    # Reindex to a complete hourly range so missing hours become explicit NaNs.
-    # The index stays TIMEZONE-AWARE on purpose. Making it naive local looks
-    # tidier but breaks twice a year: at spring-forward a 2 a.m. hour that never
-    # existed is invented as a permanent fake gap, and at fall-back 1 a.m. occurs
-    # twice, so drop_duplicates silently deletes a real reading. Verified on the
-    # 2023 transitions: naive lost 1 hour and invented 1; tz-aware loses neither.
+   
     df = df.reindex(pd.date_range(df.index.min(), df.index.max(),
                                   freq="h", tz=df.index.tz))
     df.index.name = "timestamp"
@@ -405,9 +309,7 @@ def diagnose_timezone(df: pd.DataFrame) -> str:
             f"{'consistent with ERCOT local time' if ok else 'NOT local time; fix SOURCE_TZ/LOCAL_TZ'}")
 
 
-# ====================================================================
 # 3. SCORE
-# ====================================================================
 
 def _trailing_center(values: pd.Series, keys, window: int, min_history: int) -> pd.Series:
     """
@@ -532,9 +434,7 @@ def detect_anomalies(df: pd.DataFrame, threshold: float = FLAG_THRESHOLD) -> pd.
     return df
 
 
-# ====================================================================
 # 4. REPORT
-# ====================================================================
 
 def coverage_report(scored: pd.DataFrame) -> str:
     total = len(scored)
@@ -617,8 +517,7 @@ def timezone_spot_check(scored: pd.DataFrame) -> str:
         return "Spot check skipped: no data on 2023-07-18."
     hour = day["demand"].idxmax().hour
     peak = day["demand"].max()
-    # The real daily peak hour wanders by an hour or two, so a small offset means
-    # nothing. A ~5-hour offset is the signature of an unconverted UTC series.
+    
     if 15 <= hour <= 20:
         verdict = "MATCH"
     elif 21 <= hour <= 23 or hour <= 1:
@@ -713,9 +612,7 @@ def run_live(now: pd.Timestamp | None = None,
     return new, stats
 
 
-# ====================================================================
 # 5. SELF-TEST  (proves the logic without touching the network)
-# ====================================================================
 
 def selftest() -> None:
     """Inject known anomalies into a synthetic series and confirm they are found."""
@@ -853,9 +750,7 @@ def selftest() -> None:
     print("\nAll self-test checks passed.")
 
 
-# ====================================================================
 # 6. MAIN
-# ====================================================================
 
 def main(argv: list[str]) -> int:
     if "--selftest" in argv:
@@ -905,8 +800,7 @@ def main(argv: list[str]) -> int:
 # ====================================================================
 # Everything below only runs when this file is launched with
 # `streamlit run ercot_anomaly_detector.py`. A plain `python
-# ercot_anomaly_detector.py` never calls run_dashboard(), so the CLI above
-# is unaffected. The dashboard reuses the exact fetch/load/score functions
+# ercot_anomaly_detector.py` never calls run_dashboard(), so the CLI above is unaffected. The dashboard reuses the exact fetch/load/score functions
 # above - there is one detector, two front ends.
 
 SAMPLE_PATH = Path("sample_data/ercot_demand_sample.csv")
